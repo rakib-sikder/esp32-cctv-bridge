@@ -1,0 +1,15 @@
+# Secrets - never commit these
+esp32-cctv/secrets.h
+cctv-vps/par_url.txt
+
+# Recorded video and thumbnails
+clips/
+*.mp4
+*.h265
+*.jpg
+
+# Python / build leftovers
+__pycache__/
+*.pyc
+build/
+*.log

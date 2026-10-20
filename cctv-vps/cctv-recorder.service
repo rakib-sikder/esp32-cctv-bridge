@@ -1,0 +1,33 @@
+[Unit]
+Description=Motion-triggered CCTV recorder (ONVIF events -> ffmpeg)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cctv
+Group=cctv
+
+Environment=CAM_IP=192.168.68.50
+Environment=CAM_ONVIF_PORT=8899
+Environment=CAM_RTSP_PORT=554
+Environment=CAM_RTSP_PATH=/live/ch00_0
+Environment=CLIP_DIR=/var/lib/cctv/clips
+Environment=POST_ROLL=10
+Environment=MAX_CLIP=300
+Environment=RETENTION_DAYS=14
+Environment=MIN_FREE_GB=2
+
+ExecStart=/opt/cctv/venv/bin/python /opt/cctv/recorder.py
+Restart=always
+RestartSec=10
+
+# the service only needs its own clip directory
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cctv
+
+[Install]
+WantedBy=multi-user.target
