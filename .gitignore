@@ -13,3 +13,7 @@ __pycache__/
 *.pyc
 build/
 *.log
+
+# listing PAR url (same idea as par_url.txt)
+browse_url.txt
+events/
