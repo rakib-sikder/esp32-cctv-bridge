@@ -6,73 +6,95 @@
 <title>CCTV</title>
 <style>
   :root { color-scheme: light dark;
-    --bg:#fff; --fg:#111; --muted:#666; --card:#f4f4f5; --line:#e4e4e7; --accent:#2563eb; }
+    --bg:#fff; --fg:#111; --muted:#6b6b76; --card:#f5f5f6; --line:#e3e3e7;
+    --accent:#2563eb; --ok:#15803d; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#0e0e11; --fg:#ededf0; --muted:#9a9aa5; --card:#1a1a20; --line:#2a2a33; --accent:#3b82f6; }
+    :root { --bg:#0e0e11; --fg:#ededf0; --muted:#9a9aa5; --card:#17171c;
+            --line:#2a2a33; --accent:#3b82f6; --ok:#4ade80; }
   }
-  * { box-sizing:border-box; }
-  body { margin:0; padding:20px 16px 60px; background:var(--bg); color:var(--fg);
-         font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
-  .wrap { max-width:760px; margin:0 auto; }
-  h1 { font-size:20px; margin:0 0 4px; }
-  .sub { color:var(--muted); font-size:14px; margin-bottom:22px; }
-  .day { background:var(--card); border:1px solid var(--line); border-radius:10px;
-         padding:14px 16px; margin-bottom:12px; }
-  .day h2 { font-size:16px; margin:0 0 2px; }
-  .meta { color:var(--muted); font-size:13px; }
-  button { font:inherit; font-size:14px; padding:8px 16px; margin-top:10px; cursor:pointer;
-    background:var(--accent); color:#fff; border:0; border-radius:8px; }
-  button[disabled] { opacity:.55; cursor:default; }
-  button.ghost { background:var(--bg); color:var(--fg); border:1px solid var(--line); }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; padding:20px 14px 70px; background:var(--bg); color:var(--fg);
+         font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  .wrap { max-width:720px; margin:0 auto; }
+  header { margin-bottom:18px; }
+  h1 { font-size:20px; margin:0 0 2px; }
+  .sub { color:var(--muted); font-size:14px; }
+
+  .toolbar { display:flex; gap:8px; flex-wrap:wrap; margin:16px 0 20px; }
+  button { font:inherit; font-size:14px; padding:9px 15px; cursor:pointer;
+           border-radius:9px; border:1px solid var(--line); background:var(--card);
+           color:var(--fg); }
+  button.primary { background:var(--accent); color:#fff; border-color:transparent; }
+  button[disabled] { opacity:.5; cursor:default; }
+
+  .day { background:var(--card); border:1px solid var(--line); border-radius:12px;
+         padding:13px 15px; margin-bottom:10px; }
+  .day .top { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+  .day h2 { font-size:16px; margin:0; }
+  .day .when { color:var(--muted); font-size:13px; white-space:nowrap; }
+  .day .meta { color:var(--muted); font-size:13px; margin-top:2px; }
+  .acts { display:flex; gap:8px; margin-top:11px; flex-wrap:wrap; }
+
+  .bar { height:4px; background:var(--line); border-radius:3px; overflow:hidden;
+         margin-top:11px; display:none; }
+  .bar.on { display:block; }
+  .bar i { display:block; height:100%; width:0; background:var(--accent); transition:width .25s; }
+  .status { color:var(--muted); font-size:13px; margin-top:7px; min-height:0; }
+  .status.done { color:var(--ok); }
+
   video { width:100%; background:#000; border-radius:10px; margin-top:12px; display:block; }
-  .bar { height:4px; background:var(--line); border-radius:3px; overflow:hidden; margin-top:10px; }
-  .bar div { height:100%; width:0; background:var(--accent); transition:width .2s; }
-  .status { color:var(--muted); font-size:13px; margin-top:8px; }
-  .err { background:#7f1d1d; color:#fff; padding:12px 14px; border-radius:8px; margin-top:10px; font-size:14px; }
-  .note { color:var(--muted); font-size:13px; margin-top:20px; }
+  .err { background:#7f1d1d; color:#fff; padding:11px 13px; border-radius:9px;
+         margin-top:10px; font-size:14px; }
+  .note { color:var(--muted); font-size:13px; margin-top:22px; line-height:1.6; }
+  .empty { color:var(--muted); padding:30px 0; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>CCTV recordings</h1>
-  <div class="sub" id="sub">loading&hellip;</div>
+  <header>
+    <h1>CCTV recordings</h1>
+    <div class="sub" id="sub">loading&hellip;</div>
+  </header>
+  <div class="toolbar" id="toolbar"></div>
   <div id="list"></div>
   <div class="note" id="note"></div>
 </div>
 
 <script type="module">
-// The listing PAR is written in here at publish time. Anyone with this page's
-// URL can read the bucket, so treat the URL as private.
+// Written in at publish time. Anyone holding this page's URL can read the
+// recordings, so the URL is a credential.
 const PAR = "__PAR_URL__";
 const FPS = "14";
+const DAYS_BACK = 60;          // matches the bucket's delete-after-60-days rule
 
-// ffmpeg.wasm, single threaded so it works without cross-origin isolation
-// (Object Storage cannot send the COOP/COEP headers the threaded build needs)
-const FF_VER = "0.12.10", CORE_VER = "0.12.6";
-const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${CORE_VER}/dist/esm`;
+// ffmpeg.wasm, single-threaded build: Object Storage cannot send the COOP/COEP
+// headers that the threaded build needs.
+const FF = "0.12.10", CORE = "0.12.6";
+const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${CORE}/dist/esm`;
 
-let ffmpeg = null, ffmpegReady = null;
+let ff = null, ffLoading = null;
+const built = new Map();        // day -> Blob, so watch-then-download builds once
 
-async function getFFmpeg(onNote) {
-  if (ffmpegReady) return ffmpegReady;
-  ffmpegReady = (async () => {
-    onNote("loading the video tool (one time, then cached)…");
-    const { FFmpeg } = await import(`https://unpkg.com/@ffmpeg/ffmpeg@${FF_VER}/dist/esm/index.js`);
+async function getFF(say) {
+  if (ff) return ff;
+  if (!ffLoading) ffLoading = (async () => {
+    say("preparing the video tool (one time, ~25 MB, then cached)…");
+    const { FFmpeg } = await import(`https://unpkg.com/@ffmpeg/ffmpeg@${FF}/dist/esm/index.js`);
     const { toBlobURL } = await import(`https://unpkg.com/@ffmpeg/util@0.12.1/dist/esm/index.js`);
-    const ff = new FFmpeg();
-    await ff.load({
+    const f = new FFmpeg();
+    await f.load({
       coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
       wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
     });
-    ffmpeg = ff;
-    return ff;
+    ff = f;
+    return f;
   })();
-  return ffmpegReady;
+  return ffLoading;
 }
 
-const fmtSize = b => b >= 1e9 ? (b/1e9).toFixed(2)+" GB" : (b/1e6).toFixed(1)+" MB";
+const fmt = b => b >= 1e9 ? (b/1e9).toFixed(2)+" GB" : (b/1e6).toFixed(1)+" MB";
 
-async function listPrefix(prefix) {
+async function listAll(prefix) {
   let out = [], start = null;
   for (;;) {
     const u = PAR + "?fields=name,size,timeCreated&limit=1000&prefix=" + prefix +
@@ -88,121 +110,164 @@ async function listPrefix(prefix) {
 
 const dayOf = o => new Date(o.timeCreated).toLocaleDateString("en-CA");
 
-function prettyDay(d) {
-  const today = new Date().toLocaleDateString("en-CA");
+function label(d) {
+  const t = new Date().toLocaleDateString("en-CA");
   const y = new Date(Date.now() - 864e5).toLocaleDateString("en-CA");
-  if (d === today) return "Today";
+  if (d === t) return "Today";
   if (d === y) return "Yesterday";
   return new Date(d + "T12:00:00").toLocaleDateString(undefined,
-    { weekday: "long", day: "numeric", month: "long" });
+    { weekday: "short", day: "numeric", month: "short" });
 }
 
-// Join a day's raw segments and wrap them in mp4. The video itself is left
-// alone (-c copy): this phone decodes H.265 directly, so re-encoding would
-// only waste time and quality.
-async function buildDay(objs, ui) {
-  const { bar, status, box, btn } = ui;
-  btn.disabled = true;
+function save(blob, filename) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+}
 
-  const ff = await getFFmpeg(t => status.textContent = t);
+// Fetch a day's clips, join them and wrap in mp4. The video is copied, not
+// re-encoded, so this is quick and the picture is untouched.
+async function buildDay(day, objs, ui) {
+  if (built.has(day)) return built.get(day);
+  const { bar, fill, say } = ui;
+  bar.classList.add("on");
 
-  status.textContent = `downloading ${objs.length} clips…`;
+  const f = await getFF(say);
+
+  say(`downloading ${objs.length} clips…`);
   const parts = [];
-  let done = 0;
-  for (const o of objs) {
-    const r = await fetch(PAR + o.name);
+  for (let i = 0; i < objs.length; i++) {
+    const r = await fetch(PAR + objs[i].name);
     if (r.ok) parts.push(new Uint8Array(await r.arrayBuffer()));
-    done++;
-    bar.style.width = Math.round(done / objs.length * 70) + "%";
+    fill.style.width = Math.round((i + 1) / objs.length * 75) + "%";
   }
+  if (!parts.length) throw new Error("no clips could be downloaded");
 
   const total = parts.reduce((a, p) => a + p.length, 0);
   const joined = new Uint8Array(total);
   let off = 0;
   for (const p of parts) { joined.set(p, off); off += p.length; }
 
-  status.textContent = "assembling the video…";
-  bar.style.width = "80%";
+  say("assembling…");
+  fill.style.width = "88%";
+  const inN = "in.h265", outN = "out.mp4";
+  await f.writeFile(inN, joined);
+  await f.exec(["-fflags", "+genpts", "-r", FPS, "-i", inN,
+                "-c", "copy", "-movflags", "+faststart", outN]);
+  const data = await f.readFile(outN);
+  try { await f.deleteFile(inN); await f.deleteFile(outN); } catch {}
 
-  await ff.writeFile("in.h265", joined);
-  await ff.exec(["-fflags", "+genpts", "-r", FPS, "-i", "in.h265",
-                 "-c", "copy", "-movflags", "+faststart", "out.mp4"]);
-  const out = await ff.readFile("out.mp4");
-  try { await ff.deleteFile("in.h265"); await ff.deleteFile("out.mp4"); } catch {}
-
-  bar.style.width = "100%";
-  const blob = new Blob([out.buffer], { type: "video/mp4" });
-  const url = URL.createObjectURL(blob);
-
-  const v = document.createElement("video");
-  v.controls = true; v.autoplay = true; v.src = url;
-  box.appendChild(v);
-
-  const dl = document.createElement("button");
-  dl.className = "ghost";
-  dl.textContent = "save (" + fmtSize(blob.size) + ")";
-  dl.onclick = () => {
-    const a = document.createElement("a");
-    a.href = url; a.download = ui.day + ".mp4"; a.click();
-  };
-  box.appendChild(dl);
-
-  status.textContent = "";
-  btn.remove();
+  fill.style.width = "100%";
+  const blob = new Blob([data.buffer], { type: "video/mp4" });
+  built.set(day, blob);
+  return blob;
 }
 
 (async () => {
   const sub = document.getElementById("sub");
   const list = document.getElementById("list");
+  const toolbar = document.getElementById("toolbar");
+
   try {
-    const segs = await listPrefix("esp32/");
-    if (!segs.length) { sub.textContent = "Nothing recorded yet."; return; }
+    const segs = await listAll("esp32/");
+    if (!segs.length) {
+      sub.textContent = "";
+      list.innerHTML = "<p class='empty'>Nothing recorded yet. The ESP32 uploads a clip whenever it sees movement.</p>";
+      return;
+    }
 
+    const cutoff = new Date(Date.now() - DAYS_BACK * 864e5).toLocaleDateString("en-CA");
     const days = {};
-    for (const o of segs) (days[dayOf(o)] ||= []).push(o);
-
+    for (const o of segs) {
+      const d = dayOf(o);
+      if (d >= cutoff) (days[d] ||= []).push(o);
+    }
     const names = Object.keys(days).sort().reverse();
-    const totalBytes = segs.reduce((a, o) => a + (o.size || 0), 0);
-    sub.textContent = `${names.length} day(s) · ${segs.length} clips · ${fmtSize(totalBytes)}`;
+    const grand = segs.reduce((a, o) => a + (o.size || 0), 0);
+    sub.textContent = `${names.length} day(s) with recordings · ${segs.length} clips · ${fmt(grand)}`;
+
+    // download everything, one day at a time so memory stays sane
+    const all = document.createElement("button");
+    all.className = "primary";
+    all.textContent = "Download all " + names.length + " days";
+    all.onclick = async () => {
+      all.disabled = true;
+      for (const d of names) {
+        const card = document.getElementById("card-" + d);
+        card?.scrollIntoView({ block: "center", behavior: "smooth" });
+        try { await card.__download(); } catch { /* keep going */ }
+      }
+      all.textContent = "Done";
+    };
+    toolbar.appendChild(all);
 
     for (const d of names) {
       const objs = days[d].sort((a, b) => a.timeCreated < b.timeCreated ? -1 : 1);
       const bytes = objs.reduce((a, o) => a + (o.size || 0), 0);
+      const first = new Date(objs[0].timeCreated).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const last = new Date(objs.at(-1).timeCreated).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
-      const div = document.createElement("div");
-      div.className = "day";
-      div.innerHTML = `<h2>${prettyDay(d)}</h2>
-        <div class="meta">${d} · ${objs.length} clips · ${fmtSize(bytes)}</div>`;
+      const card = document.createElement("div");
+      card.className = "day";
+      card.id = "card-" + d;
+      card.innerHTML =
+        `<div class="top"><h2>${label(d)}</h2><span class="when">${first} – ${last}</span></div>
+         <div class="meta">${d} · ${objs.length} clips · ${fmt(bytes)}</div>`;
 
-      const btn = document.createElement("button");
-      btn.textContent = "play this day";
-      const bar = document.createElement("div");
-      bar.className = "bar"; bar.innerHTML = "<div></div>";
-      const status = document.createElement("div");
-      status.className = "status";
+      const acts = document.createElement("div"); acts.className = "acts";
+      const watch = document.createElement("button"); watch.textContent = "Watch";
+      const dl = document.createElement("button"); dl.textContent = "Download";
+      acts.append(watch, dl);
 
-      div.append(btn, bar, status);
-      list.appendChild(div);
+      const bar = document.createElement("div"); bar.className = "bar";
+      const fill = document.createElement("i"); bar.appendChild(fill);
+      const status = document.createElement("div"); status.className = "status";
+      const say = t => { status.textContent = t; status.classList.remove("done"); };
 
-      btn.onclick = async () => {
+      card.append(acts, bar, status);
+      list.appendChild(card);
+
+      const run = async (then) => {
+        watch.disabled = dl.disabled = true;
         try {
-          await buildDay(objs, { bar: bar.firstChild, status, box: div, btn, day: d });
+          const blob = await buildDay(d, objs, { bar, fill, say });
+          then(blob);
         } catch (e) {
           const err = document.createElement("div");
           err.className = "err";
-          err.textContent = "Could not build this day: " + e.message;
-          div.appendChild(err);
-          btn.disabled = false;
+          err.textContent = e.message;
+          card.appendChild(err);
+        } finally {
+          watch.disabled = dl.disabled = false;
+          bar.classList.remove("on");
         }
       };
+
+      watch.onclick = () => run(blob => {
+        say("");
+        let v = card.querySelector("video");
+        if (!v) { v = document.createElement("video"); v.controls = true; card.appendChild(v); }
+        v.src = URL.createObjectURL(blob);
+        v.play().catch(() => {});
+      });
+
+      card.__download = () => run(blob => {
+        save(blob, `cctv-${d}.mp4`);
+        status.textContent = "saved · " + fmt(blob.size);
+        status.classList.add("done");
+      });
+      dl.onclick = () => card.__download();
     }
 
     document.getElementById("note").textContent =
-      "Clips are joined in your browser - nothing runs on a PC. The video tool " +
-      "downloads once on first use and is cached afterwards. Large days take longer.";
+      "Videos are assembled on this device - nothing runs on a PC or a server. " +
+      "The first build downloads the video tool once; after that each day takes " +
+      "a few seconds. Days older than " + DAYS_BACK + " are deleted automatically.";
   } catch (e) {
-    list.innerHTML = `<div class="err">${e.message}</div>`;
     sub.textContent = "";
+    list.innerHTML = `<div class="err">${e.message}</div>`;
   }
 })();
 </script>
