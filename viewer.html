@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CCTV</title>
+<style>
+  :root { color-scheme: light dark;
+    --bg:#fff; --fg:#111; --muted:#666; --card:#f4f4f5; --line:#e4e4e7; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0e0e11; --fg:#ededf0; --muted:#9a9aa5; --card:#1a1a20; --line:#2a2a33; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:20px 16px 60px; background:var(--bg); color:var(--fg);
+         font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  .wrap { max-width:760px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:14px; margin-bottom:22px; }
+  video { width:100%; background:#000; border-radius:10px; display:block; }
+  .day { background:var(--card); border:1px solid var(--line); border-radius:10px;
+         padding:14px 16px; margin-bottom:12px; }
+  .day h2 { font-size:16px; margin:0 0 2px; }
+  .day .meta { color:var(--muted); font-size:13px; }
+  .row { display:flex; gap:10px; margin-top:10px; flex-wrap:wrap; }
+  .row a, .row button { font:inherit; font-size:14px; padding:7px 14px; cursor:pointer;
+    background:var(--bg); color:var(--fg); border:1px solid var(--line);
+    border-radius:8px; text-decoration:none; }
+  .note { color:var(--muted); font-size:13px; margin-top:18px; }
+  .err { background:#7f1d1d; color:#fff; padding:12px 14px; border-radius:8px; }
+  .pending { color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>CCTV recordings</h1>
+  <div class="sub" id="sub">loading&hellip;</div>
+  <div id="list"></div>
+  <div class="note" id="note"></div>
+</div>
+
+<script>
+// The listing PAR is written in here when this page is uploaded.
+// Anyone with this page's URL can read the bucket, so treat the URL as private.
+const PAR = "__PAR_URL__";
+
+const fmtSize = b => (b / 1e6).toFixed(1) + " MB";
+
+async function listPrefix(prefix) {
+  let out = [], start = null;
+  for (;;) {
+    let u = PAR + "?fields=name,size,timeCreated&limit=1000&prefix=" + prefix +
+            (start ? "&start=" + encodeURIComponent(start) : "");
+    const r = await fetch(u);
+    if (!r.ok) throw new Error("listing failed: HTTP " + r.status);
+    const j = await r.json();
+    out = out.concat(j.objects || []);
+    if (!j.nextStartWith) return out;
+    start = j.nextStartWith;
+  }
+}
+
+function dayOf(o) {
+  return new Date(o.timeCreated).toLocaleDateString("en-CA");  // YYYY-MM-DD
+}
+
+function prettyDay(d) {
+  const today = new Date().toLocaleDateString("en-CA");
+  const y = new Date(Date.now() - 864e5).toLocaleDateString("en-CA");
+  if (d === today) return "Today";
+  if (d === y) return "Yesterday";
+  return new Date(d + "T12:00:00").toLocaleDateString(undefined,
+    { weekday: "long", day: "numeric", month: "long" });
+}
+
+(async () => {
+  const sub = document.getElementById("sub");
+  const list = document.getElementById("list");
+  try {
+    const [daily, segs] = await Promise.all([listPrefix("daily/"), listPrefix("esp32/")]);
+
+    // how much raw footage exists per day, so days still waiting to be built show up
+    const rawByDay = {};
+    for (const o of segs) {
+      const d = dayOf(o);
+      rawByDay[d] = rawByDay[d] || { n: 0, bytes: 0 };
+      rawByDay[d].n++; rawByDay[d].bytes += o.size || 0;
+    }
+
+    const built = {};
+    for (const o of daily) {
+      const m = o.name.match(/daily\/(\d{4}-\d{2}-\d{2})\.mp4$/);
+      if (m) built[m[1]] = o;
+    }
+
+    const days = [...new Set([...Object.keys(rawByDay), ...Object.keys(built)])].sort().reverse();
+    if (!days.length) { sub.textContent = "Nothing recorded yet."; return; }
+
+    const totalBytes = segs.reduce((a, o) => a + (o.size || 0), 0);
+    sub.textContent = days.length + " day(s) · " + segs.length + " clips · " + fmtSize(totalBytes);
+
+    for (const d of days) {
+      const div = document.createElement("div");
+      div.className = "day";
+      const raw = rawByDay[d];
+      const vid = built[d];
+
+      div.innerHTML = "<h2>" + prettyDay(d) + "</h2><div class='meta'>" + d +
+        (raw ? " · " + raw.n + " clips · " + fmtSize(raw.bytes) : "") + "</div>";
+
+      if (vid) {
+        const v = document.createElement("video");
+        v.controls = true; v.preload = "none";
+        v.src = PAR + vid.name;
+        v.style.marginTop = "12px";
+        div.appendChild(v);
+        const row = document.createElement("div");
+        row.className = "row";
+        row.innerHTML = "<a href='" + PAR + vid.name + "' download>download (" +
+                        fmtSize(vid.size) + ")</a>";
+        div.appendChild(row);
+      } else {
+        const p = document.createElement("div");
+        p.className = "row pending";
+        p.textContent = "Not joined yet — run daily.py for this date.";
+        div.appendChild(p);
+      }
+      list.appendChild(div);
+    }
+    document.getElementById("note").textContent =
+      "Days show up here as soon as the camera records. A day becomes playable " +
+      "once daily.py has joined and converted it.";
+  } catch (e) {
+    list.innerHTML = "<div class='err'>" + e.message +
+      "<br><br>If this says 404, the PAR in this page lacks object listing.</div>";
+    sub.textContent = "";
+  }
+})();
+</script>
+</body>
+</html>
