@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CCTV</title>
+<style>
+  :root { color-scheme: light dark;
+    --bg:#fff; --fg:#111; --muted:#6b6b76; --card:#f5f5f6; --line:#e3e3e7;
+    --accent:#2563eb; --ok:#15803d; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0e0e11; --fg:#ededf0; --muted:#9a9aa5; --card:#17171c;
+            --line:#2a2a33; --accent:#3b82f6; --ok:#4ade80; }
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; padding:20px 14px 70px; background:var(--bg); color:var(--fg);
+         font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  .wrap { max-width:720px; margin:0 auto; }
+  header { margin-bottom:18px; }
+  h1 { font-size:20px; margin:0 0 2px; }
+  .sub { color:var(--muted); font-size:14px; }
+
+  .toolbar { display:flex; gap:8px; flex-wrap:wrap; margin:16px 0 20px; }
+  button { font:inherit; font-size:14px; padding:9px 15px; cursor:pointer;
+           border-radius:9px; border:1px solid var(--line); background:var(--card);
+           color:var(--fg); }
+  button.primary { background:var(--accent); color:#fff; border-color:transparent; }
+  button[disabled] { opacity:.5; cursor:default; }
+
+  .day { background:var(--card); border:1px solid var(--line); border-radius:12px;
+         padding:13px 15px; margin-bottom:10px; }
+  .day .top { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+  .day h2 { font-size:16px; margin:0; }
+  .day .when { color:var(--muted); font-size:13px; white-space:nowrap; }
+  .day .meta { color:var(--muted); font-size:13px; margin-top:2px; }
+  .acts { display:flex; gap:8px; margin-top:11px; flex-wrap:wrap; }
+
+  .bar { height:4px; background:var(--line); border-radius:3px; overflow:hidden;
+         margin-top:11px; display:none; }
+  .bar.on { display:block; }
+  .bar i { display:block; height:100%; width:0; background:var(--accent); transition:width .25s; }
+  .status { color:var(--muted); font-size:13px; margin-top:7px; min-height:0; }
+  .status.done { color:var(--ok); }
+
+  video { width:100%; background:#000; border-radius:10px; margin-top:12px; display:block; }
+  .err { background:#7f1d1d; color:#fff; padding:11px 13px; border-radius:9px;
+         margin-top:10px; font-size:14px; }
+  .note { color:var(--muted); font-size:13px; margin-top:22px; line-height:1.6; }
+  .empty { color:var(--muted); padding:30px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>CCTV recordings</h1>
+    <div class="sub" id="sub">loading&hellip;</div>
+  </header>
+  <div class="toolbar" id="toolbar"></div>
+  <div id="list"></div>
+  <div class="note" id="note"></div>
+</div>
+
+<script type="module">
+// Written in at publish time. Anyone holding this page's URL can read the
+// recordings, so the URL is a credential.
+// The bucket URL can be baked in at publish time, or - when this page is
+// hosted somewhere public like GitHub Pages - left out and supplied once by
+// whoever opens it. In that case it is kept in this browser only, so the page
+// itself carries no secret and is safe to host in the open.
+const BAKED = "__PAR_URL__";
+const KEY = "cctv_par_url";
+
+let PAR = BAKED.startsWith("__") ? (localStorage.getItem(KEY) || "") : BAKED;
+if (PAR && !PAR.endsWith("/")) PAR += "/";
+
+const FPS = 14;
+const DAYS_BACK = 60;          // matches the bucket's delete-after-60-days rule
+
+const built = new Map();        // day -> Blob, so watch-then-download builds once
+
+// mp4mux.js is inlined here at publish time: the clips only need a container,
+// not a re-encode, so there is nothing to download and nothing to wait for.
+// Wrap a raw Annex-B H.265 stream in an mp4 container.
+//
+// The camera's clips are bare H.265 with start codes - no container - so no
+// browser will play them. Re-encoding is unnecessary (phones decode H.265
+// fine), the bytes just need an mp4 around them. That is all this does, which
+// is why it is a few hundred lines instead of a 32 MB ffmpeg build.
+//
+// Works in the browser and in Node (same code, no dependencies).
+
+const VCL_MAX = 31;        // NAL types 0..31 are coded slices
+const VPS = 32, SPS = 33, PPS = 34;
+
+// --- Annex-B -> NAL units ---------------------------------------------------
+
+function splitNals(buf) {
+  const nals = [];
+  let i = 0, start = -1;
+  while (i < buf.length - 3) {
+    if (buf[i] === 0 && buf[i + 1] === 0 &&
+        (buf[i + 2] === 1 || (buf[i + 2] === 0 && buf[i + 3] === 1))) {
+      const scLen = buf[i + 2] === 1 ? 3 : 4;
+      if (start >= 0) nals.push(buf.subarray(start, i));
+      start = i + scLen;
+      i += scLen;
+    } else {
+      i++;
+    }
+  }
+  if (start >= 0 && start < buf.length) nals.push(buf.subarray(start, buf.length));
+  return nals.filter(n => n.length >= 2);
+}
+
+const nalType = n => (n[0] >> 1) & 0x3f;
+
+// Strip the 0x03 bytes H.26x inserts so payload can never look like a start code.
+function rbsp(nal) {
+  const out = new Uint8Array(nal.length);
+  let o = 0, zeros = 0;
+  for (let i = 0; i < nal.length; i++) {
+    if (zeros === 2 && nal[i] === 3) { zeros = 0; continue; }
+    out[o++] = nal[i];
+    zeros = nal[i] === 0 ? zeros + 1 : 0;
+  }
+  return out.subarray(0, o);
+}
+
+// --- just enough SPS parsing for the hvcC header ----------------------------
+
+class Bits {
+  constructor(b) { this.b = b; this.p = 0; }
+  u(n) { let v = 0; for (let i = 0; i < n; i++) {
+    v = (v * 2) + ((this.b[this.p >> 3] >> (7 - (this.p & 7))) & 1); this.p++; } return v; }
+}
+
+function parseSps(sps) {
+  const r = rbsp(sps);
+  const s = new Bits(r);
+  s.u(16);                       // NAL header
+  s.u(4);                        // sps_video_parameter_set_id
+  const maxSub = s.u(3);         // sps_max_sub_layers_minus1
+  s.u(1);                        // sps_temporal_id_nesting_flag
+  // profile_tier_level
+  const space = s.u(2), tier = s.u(1), profile = s.u(5);
+  const compat = [s.u(8), s.u(8), s.u(8), s.u(8)];
+  const constraint = [s.u(8), s.u(8), s.u(8), s.u(8), s.u(8), s.u(8)];
+  const level = s.u(8);
+  return { space, tier, profile, compat, constraint, level, maxSub };
+}
+
+// --- box writing ------------------------------------------------------------
+
+const enc = s => Uint8Array.from(s, c => c.charCodeAt(0));
+
+function box(type, ...payload) {
+  let len = 8;
+  for (const p of payload) len += p.length;
+  const out = new Uint8Array(len);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, len);
+  out.set(enc(type), 4);
+  let o = 8;
+  for (const p of payload) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+function u32(...vals) {
+  const a = new Uint8Array(vals.length * 4);
+  const dv = new DataView(a.buffer);
+  vals.forEach((v, i) => dv.setUint32(i * 4, v >>> 0));
+  return a;
+}
+function u16(...vals) {
+  const a = new Uint8Array(vals.length * 2);
+  const dv = new DataView(a.buffer);
+  vals.forEach((v, i) => dv.setUint16(i * 2, v & 0xffff));
+  return a;
+}
+const u8 = (...v) => Uint8Array.from(v);
+
+function concat(arrs) {
+  let n = 0;
+  for (const a of arrs) n += a.length;
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const a of arrs) { out.set(a, o); o += a.length; }
+  return out;
+}
+
+// --- hvcC -------------------------------------------------------------------
+
+function hvcC(vps, sps, pps, info) {
+  const sets = [[VPS, vps], [SPS, sps], [PPS, pps]].filter(([, n]) => n);
+  const arrays = sets.map(([t, n]) => concat([
+    u8(0x80 | t),        // array_completeness | NAL type
+    u16(1),              // one NAL of this type
+    u16(n.length), n,
+  ]));
+  return box("hvcC", concat([
+    u8(1),                                        // configurationVersion
+    u8((info.space << 6) | (info.tier << 5) | info.profile),
+    u8(...info.compat),
+    u8(...info.constraint),
+    u8(info.level),
+    u16(0xf000),                                  // min_spatial_segmentation
+    u8(0xfc),                                     // parallelismType
+    u8(0xfc | 1),                                 // chromaFormat 4:2:0
+    u8(0xf8),                                     // bitDepthLumaMinus8 = 0
+    u8(0xf8),                                     // bitDepthChromaMinus8 = 0
+    u16(0),                                       // avgFrameRate (0 = unspecified)
+    u8((0 << 6) | (1 << 3) | (0 << 2) | 3),       // constantFrameRate, numTemporalLayers, lengthSizeMinusOne=3
+    u8(sets.length),
+    concat(arrays),
+  ]));
+}
+
+// --- the muxer --------------------------------------------------------------
+
+/**
+ * @param {Uint8Array} annexb  concatenated raw H.265
+ * @param {object} opts  { width, height, fps }
+ * @returns {Uint8Array} an mp4 file
+ */
+function muxHevcToMp4(annexb, opts = {}) {
+  const fps = opts.fps || 14;
+  const nals = splitNals(annexb);
+
+  let vps = null, sps = null, pps = null;
+  const samples = [];            // { nals: [], key: bool }
+  let cur = null;
+
+  for (const n of nals) {
+    const t = nalType(n);
+    if (t === VPS) { vps = n; continue; }
+    if (t === SPS) { sps = n; continue; }
+    if (t === PPS) { pps = n; continue; }
+    if (t > VCL_MAX) continue;   // SEI and friends: not needed for playback
+
+    // Every coded slice starts a new sample. Parameter sets are carried in
+    // hvcC, so they do not go in the samples.
+    cur = { nals: [n], key: t >= 16 && t <= 23 };
+    samples.push(cur);
+  }
+
+  if (!sps || !samples.length) {
+    throw new Error("no usable video found (need an SPS and at least one frame)");
+  }
+
+  const info = parseSps(sps);
+  const width = opts.width || 640, height = opts.height || 720;
+
+  // mdat: each sample is its NALs, each prefixed with a 4-byte length
+  const chunks = [];
+  const sizes = [];
+  for (const s of samples) {
+    let size = 0;
+    for (const n of s.nals) {
+      chunks.push(u32(n.length));
+      chunks.push(n);
+      size += 4 + n.length;
+    }
+    sizes.push(size);
+  }
+  const mdatPayload = concat(chunks);
+  const mdat = box("mdat", mdatPayload);
+
+  const timescale = 1000;
+  const dur = Math.round(timescale / fps);
+  const total = dur * samples.length;
+
+  const mvhd = box("mvhd", concat([
+    u32(0), u32(0), u32(0), u32(timescale), u32(total), u32(0x00010000),
+    u16(0x0100), u16(0), u32(0, 0),
+    u32(0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000),
+    u32(0, 0, 0, 0, 0, 0), u32(2),
+  ]));
+
+  const tkhd = box("tkhd", concat([
+    u32(0x00000007), u32(0), u32(0), u32(1), u32(0), u32(total),
+    u32(0, 0), u16(0), u16(0), u16(0), u16(0),
+    u32(0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000),
+    u32(width << 16), u32(height << 16),
+  ]));
+
+  const mdhd = box("mdhd", concat([
+    u32(0), u32(0), u32(0), u32(timescale), u32(total), u16(0x55c4), u16(0),
+  ]));
+  const hdlr = box("hdlr", concat([
+    u32(0), u32(0), enc("vide"), u32(0, 0, 0), enc("VideoHandler\0"),
+  ]));
+
+  const hvc1 = box("hvc1", concat([
+    u8(0, 0, 0, 0, 0, 0), u16(1),
+    u16(0), u16(0), u32(0, 0, 0),
+    u16(width), u16(height),
+    u32(0x00480000), u32(0x00480000), u32(0), u16(1),
+    new Uint8Array(32),
+    u16(0x0018), u16(0xffff),
+    hvcC(vps, sps, pps, info),
+  ]));
+
+  const stsd = box("stsd", concat([u32(0), u32(1), hvc1]));
+  const stts = box("stts", concat([u32(0), u32(1), u32(samples.length), u32(dur)]));
+
+  const keys = [];
+  samples.forEach((s, i) => { if (s.key) keys.push(i + 1); });
+  const stss = keys.length && keys.length < samples.length
+    ? box("stss", concat([u32(0), u32(keys.length), u32(...keys)]))
+    : new Uint8Array(0);
+
+  const stsc = box("stsc", concat([u32(0), u32(1), u32(1), u32(samples.length), u32(1)]));
+  const stsz = box("stsz", concat([u32(0), u32(0), u32(sizes.length), u32(...sizes)]));
+
+  // one chunk holding every sample; its offset is known once the moov size is
+  // known, so build moov with a placeholder and patch it afterwards
+  const stcoAt = { v: 0 };
+  const makeMoov = (chunkOffset) => {
+    const stco = box("stco", concat([u32(0), u32(1), u32(chunkOffset)]));
+    const stbl = box("stbl", stsd, stts, stss, stsc, stsz, stco);
+    const dinf = box("dinf", box("dref", concat([u32(0), u32(1),
+      box("url ", u32(0x00000001))])));
+    const minf = box("minf", box("vmhd", concat([u32(1), u16(0, 0, 0, 0)])), dinf, stbl);
+    const mdia = box("mdia", mdhd, hdlr, minf);
+    const trak = box("trak", tkhd, mdia);
+    return box("moov", mvhd, trak);
+  };
+
+  const ftyp = box("ftyp", concat([
+    enc("isom"), u32(0x200), enc("isom"), enc("iso2"), enc("hvc1"), enc("mp41"),
+  ]));
+
+  const probe = makeMoov(0);
+  const mdatDataOffset = ftyp.length + probe.length + 8;
+  const moov = makeMoov(mdatDataOffset);
+
+  return concat([ftyp, moov, mdat]);
+}
+
+
+
+
+const fmt = b => b >= 1e9 ? (b/1e9).toFixed(2)+" GB" : (b/1e6).toFixed(1)+" MB";
+
+async function listAll(prefix) {
+  let out = [], start = null;
+  for (;;) {
+    const u = PAR + "?fields=name,size,timeCreated&limit=1000&prefix=" + prefix +
+              (start ? "&start=" + encodeURIComponent(start) : "");
+    const r = await fetch(u);
+    if (!r.ok) throw new Error("listing failed: HTTP " + r.status);
+    const j = await r.json();
+    out = out.concat(j.objects || []);
+    if (!j.nextStartWith) return out;
+    start = j.nextStartWith;
+  }
+}
+
+const dayOf = o => new Date(o.timeCreated).toLocaleDateString("en-CA");
+
+function label(d) {
+  const t = new Date().toLocaleDateString("en-CA");
+  const y = new Date(Date.now() - 864e5).toLocaleDateString("en-CA");
+  if (d === t) return "Today";
+  if (d === y) return "Yesterday";
+  return new Date(d + "T12:00:00").toLocaleDateString(undefined,
+    { weekday: "short", day: "numeric", month: "short" });
+}
+
+function save(blob, filename) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+}
+
+// Fetch a day's clips, join them and wrap in mp4. The video is copied, not
+// re-encoded, so this is quick and the picture is untouched.
+async function buildDay(day, objs, ui) {
+  if (built.has(day)) return built.get(day);
+  const { bar, fill, say } = ui;
+  bar.classList.add("on");
+
+  say(`downloading ${objs.length} clips…`);
+  const parts = [];
+  for (let i = 0; i < objs.length; i++) {
+    const r = await fetch(PAR + objs[i].name);
+    if (r.ok) parts.push(new Uint8Array(await r.arrayBuffer()));
+    fill.style.width = Math.round((i + 1) / objs.length * 90) + "%";
+  }
+  if (!parts.length) throw new Error("no clips could be downloaded");
+
+  const total = parts.reduce((a, p) => a + p.length, 0);
+  const joined = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { joined.set(p, off); off += p.length; }
+
+  say("assembling…");
+  const mp4 = muxHevcToMp4(joined, { width: 640, height: 720, fps: FPS });
+
+  fill.style.width = "100%";
+  const blob = new Blob([mp4.buffer], { type: "video/mp4" });
+  built.set(day, blob);
+  return blob;
+}
+
+function askForPar(sub, list) {
+  sub.textContent = "One-time setup";
+  list.innerHTML = `
+    <div class="day">
+      <h2>Where are your recordings?</h2>
+      <div class="meta" style="margin:6px 0 12px">
+        Paste the bucket link with listing enabled. It is stored in this browser
+        only - it is never sent anywhere and is not part of this page.
+      </div>
+      <input id="parIn" type="url" inputmode="url" spellcheck="false"
+             placeholder="https://objectstorage…/b/your-bucket/o/"
+             style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);
+                    background:var(--bg);color:var(--fg);font:inherit;font-size:14px">
+      <div class="acts"><button class="primary" id="parGo">Save and continue</button></div>
+      <div class="status" id="parErr"></div>
+    </div>`;
+  document.getElementById("parGo").onclick = () => {
+    let v = document.getElementById("parIn").value.trim();
+    if (!/^https:\/\/.+\/o\/?$/.test(v)) {
+      document.getElementById("parErr").textContent =
+        "That does not look like a bucket link - it should end in /o/";
+      return;
+    }
+    if (!v.endsWith("/")) v += "/";
+    localStorage.setItem(KEY, v);
+    location.reload();
+  };
+}
+
+(async () => {
+  const sub = document.getElementById("sub");
+  const list = document.getElementById("list");
+  const toolbar = document.getElementById("toolbar");
+
+  if (!PAR) { askForPar(sub, list); return; }
+
+  try {
+    const segs = await listAll("esp32/");
+    if (!segs.length) {
+      sub.textContent = "";
+      list.innerHTML = "<p class='empty'>Nothing recorded yet. The ESP32 uploads a clip whenever it sees movement.</p>";
+      return;
+    }
+
+    const cutoff = new Date(Date.now() - DAYS_BACK * 864e5).toLocaleDateString("en-CA");
+    const days = {};
+    for (const o of segs) {
+      const d = dayOf(o);
+      if (d >= cutoff) (days[d] ||= []).push(o);
+    }
+    const names = Object.keys(days).sort().reverse();
+    const grand = segs.reduce((a, o) => a + (o.size || 0), 0);
+    sub.textContent = `${names.length} day(s) with recordings · ${segs.length} clips · ${fmt(grand)}`;
+
+    // download everything, one day at a time so memory stays sane
+    const all = document.createElement("button");
+    all.className = "primary";
+    all.textContent = "Download all " + names.length + " days";
+    all.onclick = async () => {
+      all.disabled = true;
+      for (const d of names) {
+        const card = document.getElementById("card-" + d);
+        card?.scrollIntoView({ block: "center", behavior: "smooth" });
+        try { await card.__download(); } catch { /* keep going */ }
+      }
+      all.textContent = "Done";
+    };
+    toolbar.appendChild(all);
+
+    for (const d of names) {
+      const objs = days[d].sort((a, b) => a.timeCreated < b.timeCreated ? -1 : 1);
+      const bytes = objs.reduce((a, o) => a + (o.size || 0), 0);
+      const first = new Date(objs[0].timeCreated).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const last = new Date(objs.at(-1).timeCreated).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+      const card = document.createElement("div");
+      card.className = "day";
+      card.id = "card-" + d;
+      card.innerHTML =
+        `<div class="top"><h2>${label(d)}</h2><span class="when">${first} – ${last}</span></div>
+         <div class="meta">${d} · ${objs.length} clips · ${fmt(bytes)}</div>`;
+
+      const acts = document.createElement("div"); acts.className = "acts";
+      const watch = document.createElement("button"); watch.textContent = "Watch";
+      const dl = document.createElement("button"); dl.textContent = "Download";
+      acts.append(watch, dl);
+
+      const bar = document.createElement("div"); bar.className = "bar";
+      const fill = document.createElement("i"); bar.appendChild(fill);
+      const status = document.createElement("div"); status.className = "status";
+      const say = t => { status.textContent = t; status.classList.remove("done"); };
+
+      card.append(acts, bar, status);
+      list.appendChild(card);
+
+      const run = async (then) => {
+        watch.disabled = dl.disabled = true;
+        try {
+          const blob = await buildDay(d, objs, { bar, fill, say });
+          then(blob);
+        } catch (e) {
+          const err = document.createElement("div");
+          err.className = "err";
+          err.textContent = e.message;
+          card.appendChild(err);
+        } finally {
+          watch.disabled = dl.disabled = false;
+          bar.classList.remove("on");
+        }
+      };
+
+      watch.onclick = () => run(blob => {
+        say("");
+        let v = card.querySelector("video");
+        if (!v) { v = document.createElement("video"); v.controls = true; card.appendChild(v); }
+        v.src = URL.createObjectURL(blob);
+        v.play().catch(() => {});
+      });
+
+      card.__download = () => run(blob => {
+        save(blob, `cctv-${d}.mp4`);
+        status.textContent = "saved · " + fmt(blob.size);
+        status.classList.add("done");
+      });
+      dl.onclick = () => card.__download();
+    }
+
+    document.getElementById("note").textContent =
+      "Videos are assembled on this device - nothing runs on a PC or a server. " +
+      "The first build downloads the video tool once; after that each day takes " +
+      "a few seconds. Days older than " + DAYS_BACK + " are deleted automatically.";
+  } catch (e) {
+    sub.textContent = "";
+    list.innerHTML = `<div class="err">${e.message}</div>`;
+    if (BAKED.startsWith("__")) {
+      const b = document.createElement("button");
+      b.textContent = "Use a different bucket link";
+      b.style.marginTop = "12px";
+      b.onclick = () => { localStorage.removeItem(KEY); location.reload(); };
+      list.appendChild(b);
+    }
+  }
+})();
+</script>
+</body>
+</html>

@@ -63,7 +63,16 @@
 <script type="module">
 // Written in at publish time. Anyone holding this page's URL can read the
 // recordings, so the URL is a credential.
-const PAR = "__PAR_URL__";
+// The bucket URL can be baked in at publish time, or - when this page is
+// hosted somewhere public like GitHub Pages - left out and supplied once by
+// whoever opens it. In that case it is kept in this browser only, so the page
+// itself carries no secret and is safe to host in the open.
+const BAKED = "__PAR_URL__";
+const KEY = "cctv_par_url";
+
+let PAR = BAKED.startsWith("__") ? (localStorage.getItem(KEY) || "") : BAKED;
+if (PAR && !PAR.endsWith("/")) PAR += "/";
+
 const FPS = 14;
 const DAYS_BACK = 60;          // matches the bucket's delete-after-60-days rule
 
@@ -138,10 +147,41 @@ async function buildDay(day, objs, ui) {
   return blob;
 }
 
+function askForPar(sub, list) {
+  sub.textContent = "One-time setup";
+  list.innerHTML = `
+    <div class="day">
+      <h2>Where are your recordings?</h2>
+      <div class="meta" style="margin:6px 0 12px">
+        Paste the bucket link with listing enabled. It is stored in this browser
+        only - it is never sent anywhere and is not part of this page.
+      </div>
+      <input id="parIn" type="url" inputmode="url" spellcheck="false"
+             placeholder="https://objectstorage…/b/your-bucket/o/"
+             style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);
+                    background:var(--bg);color:var(--fg);font:inherit;font-size:14px">
+      <div class="acts"><button class="primary" id="parGo">Save and continue</button></div>
+      <div class="status" id="parErr"></div>
+    </div>`;
+  document.getElementById("parGo").onclick = () => {
+    let v = document.getElementById("parIn").value.trim();
+    if (!/^https:\/\/.+\/o\/?$/.test(v)) {
+      document.getElementById("parErr").textContent =
+        "That does not look like a bucket link - it should end in /o/";
+      return;
+    }
+    if (!v.endsWith("/")) v += "/";
+    localStorage.setItem(KEY, v);
+    location.reload();
+  };
+}
+
 (async () => {
   const sub = document.getElementById("sub");
   const list = document.getElementById("list");
   const toolbar = document.getElementById("toolbar");
+
+  if (!PAR) { askForPar(sub, list); return; }
 
   try {
     const segs = await listAll("esp32/");
@@ -241,6 +281,13 @@ async function buildDay(day, objs, ui) {
   } catch (e) {
     sub.textContent = "";
     list.innerHTML = `<div class="err">${e.message}</div>`;
+    if (BAKED.startsWith("__")) {
+      const b = document.createElement("button");
+      b.textContent = "Use a different bucket link";
+      b.style.marginTop = "12px";
+      b.onclick = () => { localStorage.removeItem(KEY); location.reload(); };
+      list.appendChild(b);
+    }
   }
 })();
 </script>
