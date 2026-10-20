@@ -30,8 +30,15 @@ def par_url():
 
 def main():
     par = par_url()
-    src = os.path.join(HERE, "viewer.html")
-    html = open(src, encoding="utf-8").read().replace("__PAR_URL__", par)
+    html = open(os.path.join(HERE, "viewer.html"), encoding="utf-8").read()
+
+    # Inline the muxer so the published page is a single self-contained file.
+    # Its `export` keywords go, since it stops being a module of its own.
+    mux = open(os.path.join(HERE, "mp4mux.js"), encoding="utf-8").read()
+    mux = mux.replace("export function ", "function ").replace("export default muxHevcToMp4;", "")
+    if "__MP4MUX__" not in html:
+        sys.exit("viewer.html has no __MP4MUX__ marker to put the muxer in.")
+    html = html.replace("// __MP4MUX__", mux).replace("__PAR_URL__", par)
 
     target = par + "viewer.html"
     req = request.Request(target, data=html.encode("utf-8"), method="PUT",

@@ -64,33 +64,14 @@
 // Written in at publish time. Anyone holding this page's URL can read the
 // recordings, so the URL is a credential.
 const PAR = "__PAR_URL__";
-const FPS = "14";
+const FPS = 14;
 const DAYS_BACK = 60;          // matches the bucket's delete-after-60-days rule
 
-// ffmpeg.wasm, single-threaded build: Object Storage cannot send the COOP/COEP
-// headers that the threaded build needs.
-const FF = "0.12.10", CORE = "0.12.6";
-const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${CORE}/dist/esm`;
-
-let ff = null, ffLoading = null;
 const built = new Map();        // day -> Blob, so watch-then-download builds once
 
-async function getFF(say) {
-  if (ff) return ff;
-  if (!ffLoading) ffLoading = (async () => {
-    say("preparing the video tool (one time, ~25 MB, then cached)…");
-    const { FFmpeg } = await import(`https://unpkg.com/@ffmpeg/ffmpeg@${FF}/dist/esm/index.js`);
-    const { toBlobURL } = await import(`https://unpkg.com/@ffmpeg/util@0.12.1/dist/esm/index.js`);
-    const f = new FFmpeg();
-    await f.load({
-      coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
-      wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
-    });
-    ff = f;
-    return f;
-  })();
-  return ffLoading;
-}
+// mp4mux.js is inlined here at publish time: the clips only need a container,
+// not a re-encode, so there is nothing to download and nothing to wait for.
+// __MP4MUX__
 
 const fmt = b => b >= 1e9 ? (b/1e9).toFixed(2)+" GB" : (b/1e6).toFixed(1)+" MB";
 
@@ -134,14 +115,12 @@ async function buildDay(day, objs, ui) {
   const { bar, fill, say } = ui;
   bar.classList.add("on");
 
-  const f = await getFF(say);
-
   say(`downloading ${objs.length} clips…`);
   const parts = [];
   for (let i = 0; i < objs.length; i++) {
     const r = await fetch(PAR + objs[i].name);
     if (r.ok) parts.push(new Uint8Array(await r.arrayBuffer()));
-    fill.style.width = Math.round((i + 1) / objs.length * 75) + "%";
+    fill.style.width = Math.round((i + 1) / objs.length * 90) + "%";
   }
   if (!parts.length) throw new Error("no clips could be downloaded");
 
@@ -151,16 +130,10 @@ async function buildDay(day, objs, ui) {
   for (const p of parts) { joined.set(p, off); off += p.length; }
 
   say("assembling…");
-  fill.style.width = "88%";
-  const inN = "in.h265", outN = "out.mp4";
-  await f.writeFile(inN, joined);
-  await f.exec(["-fflags", "+genpts", "-r", FPS, "-i", inN,
-                "-c", "copy", "-movflags", "+faststart", outN]);
-  const data = await f.readFile(outN);
-  try { await f.deleteFile(inN); await f.deleteFile(outN); } catch {}
+  const mp4 = muxHevcToMp4(joined, { width: 640, height: 720, fps: FPS });
 
   fill.style.width = "100%";
-  const blob = new Blob([data.buffer], { type: "video/mp4" });
+  const blob = new Blob([mp4.buffer], { type: "video/mp4" });
   built.set(day, blob);
   return blob;
 }
