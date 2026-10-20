@@ -6,9 +6,9 @@
 <title>CCTV</title>
 <style>
   :root { color-scheme: light dark;
-    --bg:#fff; --fg:#111; --muted:#666; --card:#f4f4f5; --line:#e4e4e7; }
+    --bg:#fff; --fg:#111; --muted:#666; --card:#f4f4f5; --line:#e4e4e7; --accent:#2563eb; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#0e0e11; --fg:#ededf0; --muted:#9a9aa5; --card:#1a1a20; --line:#2a2a33; }
+    :root { --bg:#0e0e11; --fg:#ededf0; --muted:#9a9aa5; --card:#1a1a20; --line:#2a2a33; --accent:#3b82f6; }
   }
   * { box-sizing:border-box; }
   body { margin:0; padding:20px 16px 60px; background:var(--bg); color:var(--fg);
@@ -16,18 +16,20 @@
   .wrap { max-width:760px; margin:0 auto; }
   h1 { font-size:20px; margin:0 0 4px; }
   .sub { color:var(--muted); font-size:14px; margin-bottom:22px; }
-  video { width:100%; background:#000; border-radius:10px; display:block; }
   .day { background:var(--card); border:1px solid var(--line); border-radius:10px;
          padding:14px 16px; margin-bottom:12px; }
   .day h2 { font-size:16px; margin:0 0 2px; }
-  .day .meta { color:var(--muted); font-size:13px; }
-  .row { display:flex; gap:10px; margin-top:10px; flex-wrap:wrap; }
-  .row a, .row button { font:inherit; font-size:14px; padding:7px 14px; cursor:pointer;
-    background:var(--bg); color:var(--fg); border:1px solid var(--line);
-    border-radius:8px; text-decoration:none; }
-  .note { color:var(--muted); font-size:13px; margin-top:18px; }
-  .err { background:#7f1d1d; color:#fff; padding:12px 14px; border-radius:8px; }
-  .pending { color:var(--muted); }
+  .meta { color:var(--muted); font-size:13px; }
+  button { font:inherit; font-size:14px; padding:8px 16px; margin-top:10px; cursor:pointer;
+    background:var(--accent); color:#fff; border:0; border-radius:8px; }
+  button[disabled] { opacity:.55; cursor:default; }
+  button.ghost { background:var(--bg); color:var(--fg); border:1px solid var(--line); }
+  video { width:100%; background:#000; border-radius:10px; margin-top:12px; display:block; }
+  .bar { height:4px; background:var(--line); border-radius:3px; overflow:hidden; margin-top:10px; }
+  .bar div { height:100%; width:0; background:var(--accent); transition:width .2s; }
+  .status { color:var(--muted); font-size:13px; margin-top:8px; }
+  .err { background:#7f1d1d; color:#fff; padding:12px 14px; border-radius:8px; margin-top:10px; font-size:14px; }
+  .note { color:var(--muted); font-size:13px; margin-top:20px; }
 </style>
 </head>
 <body>
@@ -38,18 +40,43 @@
   <div class="note" id="note"></div>
 </div>
 
-<script>
-// The listing PAR is written in here when this page is uploaded.
-// Anyone with this page's URL can read the bucket, so treat the URL as private.
+<script type="module">
+// The listing PAR is written in here at publish time. Anyone with this page's
+// URL can read the bucket, so treat the URL as private.
 const PAR = "__PAR_URL__";
+const FPS = "14";
 
-const fmtSize = b => (b / 1e6).toFixed(1) + " MB";
+// ffmpeg.wasm, single threaded so it works without cross-origin isolation
+// (Object Storage cannot send the COOP/COEP headers the threaded build needs)
+const FF_VER = "0.12.10", CORE_VER = "0.12.6";
+const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${CORE_VER}/dist/esm`;
+
+let ffmpeg = null, ffmpegReady = null;
+
+async function getFFmpeg(onNote) {
+  if (ffmpegReady) return ffmpegReady;
+  ffmpegReady = (async () => {
+    onNote("loading the video tool (one time, then cached)…");
+    const { FFmpeg } = await import(`https://unpkg.com/@ffmpeg/ffmpeg@${FF_VER}/dist/esm/index.js`);
+    const { toBlobURL } = await import(`https://unpkg.com/@ffmpeg/util@0.12.1/dist/esm/index.js`);
+    const ff = new FFmpeg();
+    await ff.load({
+      coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
+      wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+    });
+    ffmpeg = ff;
+    return ff;
+  })();
+  return ffmpegReady;
+}
+
+const fmtSize = b => b >= 1e9 ? (b/1e9).toFixed(2)+" GB" : (b/1e6).toFixed(1)+" MB";
 
 async function listPrefix(prefix) {
   let out = [], start = null;
   for (;;) {
-    let u = PAR + "?fields=name,size,timeCreated&limit=1000&prefix=" + prefix +
-            (start ? "&start=" + encodeURIComponent(start) : "");
+    const u = PAR + "?fields=name,size,timeCreated&limit=1000&prefix=" + prefix +
+              (start ? "&start=" + encodeURIComponent(start) : "");
     const r = await fetch(u);
     if (!r.ok) throw new Error("listing failed: HTTP " + r.status);
     const j = await r.json();
@@ -59,9 +86,7 @@ async function listPrefix(prefix) {
   }
 }
 
-function dayOf(o) {
-  return new Date(o.timeCreated).toLocaleDateString("en-CA");  // YYYY-MM-DD
-}
+const dayOf = o => new Date(o.timeCreated).toLocaleDateString("en-CA");
 
 function prettyDay(d) {
   const today = new Date().toLocaleDateString("en-CA");
@@ -72,66 +97,111 @@ function prettyDay(d) {
     { weekday: "long", day: "numeric", month: "long" });
 }
 
+// Join a day's raw segments and wrap them in mp4. The video itself is left
+// alone (-c copy): this phone decodes H.265 directly, so re-encoding would
+// only waste time and quality.
+async function buildDay(objs, ui) {
+  const { bar, status, box, btn } = ui;
+  btn.disabled = true;
+
+  const ff = await getFFmpeg(t => status.textContent = t);
+
+  status.textContent = `downloading ${objs.length} clips…`;
+  const parts = [];
+  let done = 0;
+  for (const o of objs) {
+    const r = await fetch(PAR + o.name);
+    if (r.ok) parts.push(new Uint8Array(await r.arrayBuffer()));
+    done++;
+    bar.style.width = Math.round(done / objs.length * 70) + "%";
+  }
+
+  const total = parts.reduce((a, p) => a + p.length, 0);
+  const joined = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { joined.set(p, off); off += p.length; }
+
+  status.textContent = "assembling the video…";
+  bar.style.width = "80%";
+
+  await ff.writeFile("in.h265", joined);
+  await ff.exec(["-fflags", "+genpts", "-r", FPS, "-i", "in.h265",
+                 "-c", "copy", "-movflags", "+faststart", "out.mp4"]);
+  const out = await ff.readFile("out.mp4");
+  try { await ff.deleteFile("in.h265"); await ff.deleteFile("out.mp4"); } catch {}
+
+  bar.style.width = "100%";
+  const blob = new Blob([out.buffer], { type: "video/mp4" });
+  const url = URL.createObjectURL(blob);
+
+  const v = document.createElement("video");
+  v.controls = true; v.autoplay = true; v.src = url;
+  box.appendChild(v);
+
+  const dl = document.createElement("button");
+  dl.className = "ghost";
+  dl.textContent = "save (" + fmtSize(blob.size) + ")";
+  dl.onclick = () => {
+    const a = document.createElement("a");
+    a.href = url; a.download = ui.day + ".mp4"; a.click();
+  };
+  box.appendChild(dl);
+
+  status.textContent = "";
+  btn.remove();
+}
+
 (async () => {
   const sub = document.getElementById("sub");
   const list = document.getElementById("list");
   try {
-    const [daily, segs] = await Promise.all([listPrefix("daily/"), listPrefix("esp32/")]);
+    const segs = await listPrefix("esp32/");
+    if (!segs.length) { sub.textContent = "Nothing recorded yet."; return; }
 
-    // how much raw footage exists per day, so days still waiting to be built show up
-    const rawByDay = {};
-    for (const o of segs) {
-      const d = dayOf(o);
-      rawByDay[d] = rawByDay[d] || { n: 0, bytes: 0 };
-      rawByDay[d].n++; rawByDay[d].bytes += o.size || 0;
-    }
+    const days = {};
+    for (const o of segs) (days[dayOf(o)] ||= []).push(o);
 
-    const built = {};
-    for (const o of daily) {
-      const m = o.name.match(/daily\/(\d{4}-\d{2}-\d{2})\.mp4$/);
-      if (m) built[m[1]] = o;
-    }
-
-    const days = [...new Set([...Object.keys(rawByDay), ...Object.keys(built)])].sort().reverse();
-    if (!days.length) { sub.textContent = "Nothing recorded yet."; return; }
-
+    const names = Object.keys(days).sort().reverse();
     const totalBytes = segs.reduce((a, o) => a + (o.size || 0), 0);
-    sub.textContent = days.length + " day(s) · " + segs.length + " clips · " + fmtSize(totalBytes);
+    sub.textContent = `${names.length} day(s) · ${segs.length} clips · ${fmtSize(totalBytes)}`;
 
-    for (const d of days) {
+    for (const d of names) {
+      const objs = days[d].sort((a, b) => a.timeCreated < b.timeCreated ? -1 : 1);
+      const bytes = objs.reduce((a, o) => a + (o.size || 0), 0);
+
       const div = document.createElement("div");
       div.className = "day";
-      const raw = rawByDay[d];
-      const vid = built[d];
+      div.innerHTML = `<h2>${prettyDay(d)}</h2>
+        <div class="meta">${d} · ${objs.length} clips · ${fmtSize(bytes)}</div>`;
 
-      div.innerHTML = "<h2>" + prettyDay(d) + "</h2><div class='meta'>" + d +
-        (raw ? " · " + raw.n + " clips · " + fmtSize(raw.bytes) : "") + "</div>";
+      const btn = document.createElement("button");
+      btn.textContent = "play this day";
+      const bar = document.createElement("div");
+      bar.className = "bar"; bar.innerHTML = "<div></div>";
+      const status = document.createElement("div");
+      status.className = "status";
 
-      if (vid) {
-        const v = document.createElement("video");
-        v.controls = true; v.preload = "none";
-        v.src = PAR + vid.name;
-        v.style.marginTop = "12px";
-        div.appendChild(v);
-        const row = document.createElement("div");
-        row.className = "row";
-        row.innerHTML = "<a href='" + PAR + vid.name + "' download>download (" +
-                        fmtSize(vid.size) + ")</a>";
-        div.appendChild(row);
-      } else {
-        const p = document.createElement("div");
-        p.className = "row pending";
-        p.textContent = "Not joined yet — run daily.py for this date.";
-        div.appendChild(p);
-      }
+      div.append(btn, bar, status);
       list.appendChild(div);
+
+      btn.onclick = async () => {
+        try {
+          await buildDay(objs, { bar: bar.firstChild, status, box: div, btn, day: d });
+        } catch (e) {
+          const err = document.createElement("div");
+          err.className = "err";
+          err.textContent = "Could not build this day: " + e.message;
+          div.appendChild(err);
+          btn.disabled = false;
+        }
+      };
     }
+
     document.getElementById("note").textContent =
-      "Days show up here as soon as the camera records. A day becomes playable " +
-      "once daily.py has joined and converted it.";
+      "Clips are joined in your browser - nothing runs on a PC. The video tool " +
+      "downloads once on first use and is cached afterwards. Large days take longer.";
   } catch (e) {
-    list.innerHTML = "<div class='err'>" + e.message +
-      "<br><br>If this says 404, the PAR in this page lacks object listing.</div>";
+    list.innerHTML = `<div class="err">${e.message}</div>`;
     sub.textContent = "";
   }
 })();
